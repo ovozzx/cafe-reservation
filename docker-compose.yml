@@ -1,0 +1,16 @@
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: cafe-reservation-db
+    ports:
+      - "3309:3306"
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: cafe_reservation
+      MYSQL_USER: ebsoft
+      MYSQL_PASSWORD: ebsoft
+    volumes:
+      - cafe-reservation-data:/var/lib/mysql
+
+volumes:
+  cafe-reservation-data:
