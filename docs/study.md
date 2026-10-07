@@ -169,6 +169,54 @@ ApiResponse<String> response = new ApiResponse<>(true, "data", null);
 // response.setSuccess(false); ← setter가 없으므로 불가능
 ```
 
+### 불변 = `new`로 만들 때 값을 넣고, 이후엔 못 바꾼다
+
+> **"record 불변 객체는 new로 만들고 값 변경이 안 되는 거지?" → 맞다.** 생성 시점에 생성자로 값을 한 번에 넣고, 그 뒤로는 바꿀 수 없다.
+
+```java
+JwtProperties props = new JwtProperties("exjP...", 1800000, 604800000, "cafe-reservation");
+//                    ↑ 만들 때 생성자로 값을 한 번에 넣음
+
+props.secret();                 // ✅ 꺼내기는 가능
+props.secret = "다른값";         // ❌ 컴파일 에러 — 필드가 private final
+props.setSecret("다른값");       // ❌ 컴파일 에러 — setter가 없음
+```
+
+- record 필드는 자동으로 **`private final`** → 생성자에서 한 번 넣은 뒤 재대입 불가
+- **setter를 만들어주지 않는다** → 접근자(`secret()`)만 있음
+
+#### 다른 값이 필요하면 → 새로 만든다
+
+```java
+JwtProperties changed = new JwtProperties("새secret", props.accessTokenExpiration(), ...);
+// 기존 props는 그대로, 새 객체가 하나 더 생김
+```
+
+기존 객체를 고치는 게 아니라 **바뀐 값으로 새 객체를 만든다.** `String`이 불변이라 `str.toUpperCase()`가 원본을 바꾸지 않고 새 문자열을 돌려주는 것과 같은 방식이다.
+
+#### `new`를 꼭 내가 부르는 건 아니다
+
+`JwtProperties`는 코드에서 `new`를 쓴 적이 없다. Spring이 설정 파일 값을 읽어 **대신 `new JwtProperties(...)`를 호출**한다 (생성자 바인딩 → "JwtProperties" 섹션). 누가 만들든 **생성 시점에 값이 정해지고 이후 못 바꾸는 건** 같다.
+
+#### 주의: "얕은" 불변이다
+
+필드 자체를 다른 값으로 바꾸는 건 막지만, 필드가 `List`처럼 **안쪽 내용을 바꿀 수 있는 객체**면 그 내용은 바뀔 수 있다.
+
+```java
+record Order(List<String> items) {}
+
+Order order = new Order(new ArrayList<>(List.of("커피")));
+order.items() = new ArrayList<>();   // ❌ 불가 — 필드 재대입
+order.items().add("케이크");          // ⚠️ 가능 — 리스트는 그대로인데 안의 내용이 바뀜
+```
+
+| 필드 타입 | 완전히 불변? |
+|---|---|
+| `String`, `long`, `boolean`, `Integer`, enum | O — 원래부터 바뀌지 않는 타입 |
+| `ArrayList`, 배열, 일반 클래스 객체 | X — 안쪽 내용은 바뀔 수 있음 |
+
+`ErrorResponse`, `JwtProperties`는 바뀌지 않는 타입만 써서 해당 없다. `ApiResponse<T>`는 `T`에 `List<MenuResponse>`처럼 리스트가 들어갈 수 있지만, 응답을 만들고 바로 JSON으로 보내고 끝나서 실제로 문제 될 일은 거의 없다. 리스트를 오래 들고 있는 record를 만들 때는 `List.of(...)`(불변 리스트)를 넣거나, 생성자에서 `List.copyOf(...)`로 복사해두면 완전히 불변이 된다.
+
 ---
 
 ## 제네릭 (Generic)
@@ -752,7 +800,20 @@ createAccessToken("GUEST_a1b2c3d4", Role.GUEST);
 ```java
 Role.valueOf("GUEST")   // Role.GUEST
 Role.valueOf("guest")   // IllegalArgumentException (대소문자까지 정확히 일치해야 함)
+Role.valueOf(null)      // NullPointerException: Name is null
 ```
+
+#### `valueOf()` 입력별 결과
+
+| 넣은 값 | 결과 |
+|---|---|
+| 정확한 이름 (`"GUEST"`) | `Role.GUEST` |
+| 없는 이름 (`"guest"`, `"ABC"`) | `IllegalArgumentException` (`No enum constant ...Role.guest`) |
+| `null` | **`NullPointerException`** (`Name is null`) |
+
+> **`Role.valueOf(null)`은 `null`을 돌려주지 않고 바로 NPE를 던진다.** 그래서 `valueOf` 결과를 받은 뒤에 null 체크를 해도 소용없고, **`valueOf`를 부르기 전에** null을 걸러야 한다.
+
+`Role.valueOf(String)`은 컴파일러가 enum마다 자동으로 만들어주는 메서드다. 내부에서 `Enum.valueOf(Role.class, name)`을 호출하는데, 이 메서드가 가장 먼저 `name`이 null인지 검사해서 `NullPointerException("Name is null")`을 던진다.
 
 #### 왜 토큰에 `role` 대신 `role.name()`을 넣는가?
 
@@ -1040,10 +1101,56 @@ String roleName = claims.get("role", String.class);
 
 ```java
 public Role getRole(String token) {
-    String roleName = parseClaims(token).get("role", String.class);  // "GUEST"
-    return Role.valueOf(roleName);                                    // Role.GUEST
+    String role = parseClaims(token).get("role", String.class);  // AT: "GUEST" / RT: null
+    return role != null ? Role.valueOf(role) : null;              // null이면 valueOf를 아예 안 부름
 }
 ```
+
+- `조건 ? A : B` — 삼항 연산자. 조건이 참이면 A, 거짓이면 B (if/else와 같음)
+
+#### 처음 작성했을 때의 실수 — Refresh Token을 넣으면 500 에러
+
+처음 코드는 null 처리가 없었다.
+
+```java
+public Role getRole(String token) {
+    return Role.valueOf(parseClaims(token).get("role", String.class));
+}
+```
+
+- Access Token(AT)에는 `role` 클레임이 있지만, **Refresh Token(RT)에는 없다** (`createRefreshToken`에서 `.claim("role", ...)`을 안 넣음)
+- RT도 같은 키로 서명했으므로 `validateToken`은 **통과**한다
+- 그래서 클라이언트가 `Authorization` 헤더에 RT를 넣으면 → `get("role", ...)`이 `null` → `Role.valueOf(null)` → **NPE → 500 에러**
+
+```
+Authorization: Bearer {RT}
+→ validateToken(RT)    → true (서명 OK)
+→ getRole(RT)          → Role.valueOf(null) → 💥 NullPointerException
+```
+
+**처음 시도한 해결 — Filter에서 null 체크 (효과 없음)**
+
+```java
+// Filter
+Role role = jwtTokenProvider.getRole(token);   // ← 이 줄 안에서 이미 NPE
+if (role != null) { ... }                       // ← 여기까지 못 옴
+```
+
+`valueOf`가 null을 반환하는 게 아니라 **예외를 던지기** 때문에, 호출한 쪽에서 null 체크를 해도 의미가 없다.
+
+**최종 해결 — Provider에서 `valueOf` 전에 null 체크 + Filter에서 role 있는 경우만 인증**
+
+```java
+// Provider: RT면 null 반환
+return role != null ? Role.valueOf(role) : null;
+
+// Filter: role이 있는 토큰(= AT)만 인증 등록
+if (role != null) {
+    // 인증 객체 생성 + SecurityContext 저장
+}
+```
+
+> 더 정석적인 방법은 토큰 생성 시 `.claim("type", "access")` / `.claim("type", "refresh")`를 넣고, Filter에서 access 타입만 받는 것이다. RT로 API를 호출하는 것 자체를 명시적으로 막을 수 있다.
 
 #### 생성 ↔ 파싱 대응
 
@@ -1054,3 +1161,686 @@ public Role getRole(String token) {
 | `.claim("role", role.name())` | `Role.valueOf(claims.get("role", String.class))` |
 | `.expiration(date)` | 자동 검증 (지나면 `ExpiredJwtException`) |
 | `.compact()` → 문자열 | `.parseSignedClaims(문자열)` |
+
+---
+
+## 추상 클래스 상속과 구현 필수 메서드
+
+추상 클래스를 상속하면 **추상 메서드만** 반드시 구현해야 한다. 이미 몸통 `{}`이 있는 일반 메서드는 그대로 물려받고, 필요할 때만 재정의한다.
+
+### 코드 (JwtAuthenticationFilter)
+
+```java
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain filterChain) throws ServletException, IOException {
+        // 필터 로직
+    }
+}
+```
+
+`OncePerRequestFilter`의 추상 메서드는 `doFilterInternal` 하나뿐이라, 이것만 구현하면 된다. 구현하지 않으면 컴파일 에러가 난다.
+
+> IntelliJ: `extends OncePerRequestFilter`까지 쓰고 클래스명에서 `⌥ + Enter` → **Implement methods** (또는 `⌃ + I`)를 누르면 자동 생성된다.
+
+### 추상 메서드 vs 일반 메서드
+
+```java
+public abstract class OncePerRequestFilter {
+
+    // 일반 메서드 — 이미 구현돼 있음 → 그대로 물려받음
+    public final void doFilter(...) {
+        // "이 요청에서 이미 실행했나?" 확인
+        // 처음이면 → doFilterInternal(...) 호출
+    }
+
+    // 추상 메서드 — 몸통이 없음 → 자식이 반드시 채워야 함
+    protected abstract void doFilterInternal(...);
+}
+```
+
+| 메서드 종류 | 구현 필수? | 예시 (`OncePerRequestFilter`) |
+|---|---|---|
+| 추상 메서드 (`abstract`, 몸통 `{}` 없음) | O 필수 | `doFilterInternal` |
+| 일반 메서드 (몸통 `{}` 있음) | X 선택 (필요하면 `@Override`) | `shouldNotFilter` 등 |
+| `final` 메서드 | 재정의 **불가** | `doFilter` |
+
+> **"추상 클래스를 상속하면 메서드 구현이 필수인가?" → 추상 메서드만 필수다.** 추상 클래스의 모든 메서드를 구현해야 하는 게 아니다.
+
+### 예외: 자식도 추상 클래스면
+
+자식 클래스도 `abstract`로 선언하면 구현하지 않아도 된다. 구현 의무가 그다음 자식에게 넘어간다.
+
+```java
+public abstract class MyFilter extends OncePerRequestFilter { }            // OK — 구현 안 해도 됨
+public class RealFilter extends MyFilter { /* doFilterInternal 구현 */ }    // 여기서 필수
+```
+
+### 왜 `doFilter`가 아니라 `doFilterInternal`인가? — 템플릿 메서드 패턴
+
+필터의 원래 진입점은 `doFilter`지만, `OncePerRequestFilter`가 이미 구현해두었다 (`final`이라 바꿀 수도 없음).
+
+```
+요청 → doFilter (부모가 구현, 공통 로직)
+         → 이 요청에서 이미 실행했나?
+             → 했으면 → 건너뜀
+             → 처음이면 → doFilterInternal 호출 (자식이 구현, 실제 로직)
+```
+
+- **공통 흐름**(요청당 한 번만 실행)은 부모가 가지고 있고
+- **자식마다 달라지는 부분**(실제 필터 내용)만 추상 메서드로 비워둔다
+
+이런 설계를 **템플릿 메서드 패턴**이라고 한다. 이름의 **Once Per Request**(요청당 한 번)가 부모가 보장해주는 공통 로직이다.
+
+### 추상 클래스 vs 인터페이스
+
+| | 추상 클래스 | 인터페이스 |
+|---|---|---|
+| 구현 필수 | 추상 메서드만 | 모든 메서드 (`default` 메서드 제외) |
+| 미리 구현된 로직 | 가질 수 있음 (공통 로직) | `default` 메서드로만 |
+| 필드 | 가질 수 있음 | 상수(`static final`)만 |
+| 상속 | `extends` — 하나만 | `implements` — 여러 개 가능 |
+
+`BaseTimeEntity`도 추상 클래스지만 추상 메서드가 없다. 이 경우 `abstract`는 "구현 강제"가 아니라 **`new BaseTimeEntity()`로 직접 생성하는 것을 막는** 용도다. (→ "JpaConfig (@EnableJpaAuditing)" 섹션 참고)
+
+---
+
+## JwtAuthenticationFilter
+
+요청이 올 때마다 헤더의 토큰을 꺼내 검증하고, 통과하면 **"이 요청은 이 사용자의 것"이라고 Spring Security에 등록**하는 필터다.
+
+### Filter와 Provider의 역할 구분
+
+"Filter = 토큰 검증 클래스"는 반만 맞다. **검증 자체는 Provider**가 하고, Filter는 그 검증을 **요청마다 호출해서 결과를 SecurityContext에 등록**한다.
+
+| 클래스 | 다루는 대상 | 역할 |
+|---|---|---|
+| `JwtTokenProvider` | 토큰 | 생성, 서명/만료 검증, 값 꺼내기 |
+| `JwtAuthenticationFilter` | 요청 | 헤더에서 토큰 추출 → Provider에 검증 위임 → 인증 등록 |
+
+```
+요청 → [JwtAuthenticationFilter] ─────────────────────────→ Controller
+         1. 헤더에서 토큰 꺼내기          (Filter — resolveToken)
+         2. validateToken(토큰)         → Provider
+         3. getUserId, getRole          → Provider
+         4. SecurityContext에 인증 등록   (Filter)
+```
+
+> Filter는 토큰이 없거나 틀려도 **401을 직접 응답하지 않는다.** 등록 없이 그냥 통과시키고, 이 URL이 인증이 필요한지(→ 401)는 SecurityConfig가 판단한다. `permitAll` 경로는 토큰 없이도 통과해야 하기 때문이다.
+
+### 코드
+
+```java
+@RequiredArgsConstructor
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+
+    private final JwtTokenProvider jwtTokenProvider;
+
+    @Override
+    protected void doFilterInternal(HttpServletRequest request,
+                                    HttpServletResponse response,
+                                    FilterChain filterChain) throws ServletException, IOException {
+
+        String token = resolveToken(request);
+
+        if (token != null && jwtTokenProvider.validateToken(token)) {
+            String userId = jwtTokenProvider.getUserId(token);
+            Role role = jwtTokenProvider.getRole(token);
+
+            if (role != null) {   // role이 있는 토큰(= AT)만 인증
+                UsernamePasswordAuthenticationToken authentication =
+                        new UsernamePasswordAuthenticationToken(
+                                userId,
+                                null,
+                                List.of(new SimpleGrantedAuthority("ROLE_" + role.name()))
+                        );
+                SecurityContextHolder.getContext().setAuthentication(authentication);
+            }
+        }
+
+        filterChain.doFilter(request, response);   // ← 무조건 실행 (if 밖)
+    }
+
+    private String resolveToken(HttpServletRequest request) {
+        String bearer = request.getHeader("Authorization");
+        if (bearer != null && bearer.startsWith("Bearer ")) {
+            return bearer.substring(7);
+        }
+        return null;
+    }
+}
+```
+
+- `extends OncePerRequestFilter` — 요청당 한 번만 실행되는 필터. `doFilterInternal`만 구현하면 됨 (→ "추상 클래스 상속과 구현 필수 메서드" 섹션)
+- `@Component`를 붙이지 않는다 — 붙이면 Spring Boot가 일반 서블릿 필터로도 자동 등록해서 **두 번 실행**될 수 있음. SecurityConfig에서 `new JwtAuthenticationFilter(jwtTokenProvider)`로 직접 등록
+- `filterChain.doFilter(request, response)` — 다음 필터로 넘김. 빠지거나 `if` 안에 있으면 토큰 없는 요청이 Controller까지 가지 못한다
+
+### 전체 코드 한 줄씩 보기
+
+#### 클래스 선언부
+
+```java
+@RequiredArgsConstructor
+public class JwtAuthenticationFilter extends OncePerRequestFilter {
+
+    private final JwtTokenProvider jwtTokenProvider;
+```
+
+- `@RequiredArgsConstructor` — `final` 필드(`jwtTokenProvider`)를 받는 생성자를 Lombok이 만들어줌 → `new JwtAuthenticationFilter(jwtTokenProvider)`로 생성
+- `extends OncePerRequestFilter` — 한 요청에서 **딱 한 번만** 실행되는 필터의 부모 클래스
+- `private final JwtTokenProvider` — 토큰 검증/값 꺼내기를 맡길 Provider. Filter는 토큰을 직접 파싱하지 않고 Provider에게 위임한다
+- `@Component` 없음 — 빈으로 자동 등록하지 않고 SecurityConfig에서 직접 생성해서 등록
+
+#### 메서드 시그니처
+
+```java
+@Override
+protected void doFilterInternal(HttpServletRequest request,
+                                HttpServletResponse response,
+                                FilterChain filterChain) throws ServletException, IOException {
+```
+
+| 요소 | 의미 |
+|---|---|
+| `@Override` | 부모의 추상 메서드를 구현한다는 표시 |
+| `protected` | 부모에 `protected`로 선언돼 있어서 그대로 맞춤 (더 좁힐 수 없음) |
+| `HttpServletRequest request` | 들어온 요청 — 헤더, URL, 파라미터 등을 꺼낼 수 있음 |
+| `HttpServletResponse response` | 나갈 응답 — 여기선 직접 쓰지 않고 다음 필터에 그대로 전달 |
+| `FilterChain filterChain` | 다음 필터들로 이어지는 사슬. `doFilter`를 호출해야 다음으로 넘어감 |
+| `throws ServletException, IOException` | `filterChain.doFilter`가 던질 수 있는 예외. 부모 시그니처와 동일 |
+
+#### 본문 흐름
+
+```java
+// 1. 헤더에서 토큰 꺼내기
+String token = resolveToken(request);
+```
+`Authorization: Bearer eyJ...` → `"eyJ..."`. 헤더가 없거나 `Bearer `로 시작하지 않으면 `null`.
+
+```java
+// 2. 토큰이 있고 유효하면
+if (token != null && jwtTokenProvider.validateToken(token)) {
+```
+- `&&`는 **앞이 false면 뒤를 실행하지 않는다** (단축 평가). 그래서 `token`이 `null`이면 `validateToken`을 아예 호출하지 않음
+- `validateToken` — 서명·만료 검증. 실패하면 `false` (예외를 던지지 않음)
+
+```java
+// 3. 토큰에서 userId, role 꺼내기
+String userId = jwtTokenProvider.getUserId(token);   // sub
+Role role = jwtTokenProvider.getRole(token);         // AT: Role.GUEST 등 / RT: null
+if (role != null) {
+```
+role이 있는 토큰 = Access Token만 인증한다. Refresh Token은 role이 없어서 여기서 걸러진다.
+
+```java
+    // 4. 인증 객체 만들기
+    UsernamePasswordAuthenticationToken authentication =
+            new UsernamePasswordAuthenticationToken(
+                    userId,
+                    null,
+                    List.of(new SimpleGrantedAuthority("ROLE_" + role.name()))
+            );
+
+    // 5. SecurityContext에 저장
+    SecurityContextHolder.getContext().setAuthentication(authentication);
+}
+```
+"이 요청은 `GUEST_a1b2c3d4`가 보냈고 권한은 `ROLE_GUEST`"라고 Spring Security에 등록한다. (각 부분은 아래 "인증 객체", "권한 목록" 참고)
+
+```java
+// 6. 다음 필터로 넘기기 (토큰이 없거나 틀려도 무조건 실행)
+filterChain.doFilter(request, response);
+```
+인증 성공이든 실패든 **항상** 다음 필터로 넘긴다. 실패한 요청을 막는 건 뒤에 있는 Spring Security(SecurityConfig 설정)의 몫이다.
+
+### 상황별 동작
+
+| 요청 | `resolveToken` | `validateToken` | `role` | SecurityContext | 이후 결과 |
+|---|---|---|---|---|---|
+| 헤더 없음 | `null` | (호출 안 함) | — | 비어 있음 | permitAll → 통과 / 인증 필요 → 401 |
+| `Authorization: abc` (Bearer 아님) | `null` | (호출 안 함) | — | 비어 있음 | 위와 같음 |
+| 유효한 AT | 토큰 | `true` | `GUEST` 등 | **인증 등록** | 권한에 맞으면 Controller 도달 |
+| 만료된 AT | 토큰 | `false` | — | 비어 있음 | 인증 필요 URL이면 401 |
+| 위조된 토큰 | 토큰 | `false` | — | 비어 있음 | 인증 필요 URL이면 401 |
+| RT를 넣음 | 토큰 | `true` | `null` | 비어 있음 | 인증 필요 URL이면 401 |
+
+> **Filter는 "인증 정보를 채워주는" 역할만 한다.** 막을지 말지는 SecurityContext가 비어 있는지를 보고 Spring Security가 결정한다.
+
+### 필터 체인에서의 위치
+
+```
+요청
+ → ... (Spring Security 기본 필터들)
+ → JwtAuthenticationFilter          ← 여기서 SecurityContext 채움
+ → UsernamePasswordAuthenticationFilter (폼 로그인용 — 우리는 안 씀)
+ → ...
+ → AuthorizationFilter               ← SecurityContext를 보고 허용/401/403 결정
+ → DispatcherServlet → Controller
+```
+
+SecurityConfig에서 `addFilterBefore(jwtFilter, UsernamePasswordAuthenticationFilter.class)`로 **인가 검사보다 앞에** 끼워 넣는다. 그래야 권한 검사 시점에 인증 정보가 이미 들어 있다.
+
+> 필터에서 발생한 예외는 `GlobalExceptionHandler`(`@RestControllerAdvice`)가 잡지 못한다. 필터는 DispatcherServlet보다 **앞**에서 실행되기 때문이다. 그래서 Filter 안에서는 예외를 던지지 않고(`validateToken`이 `false` 반환), 401/403 응답 형식은 SecurityConfig의 `AuthenticationEntryPoint`/`AccessDeniedHandler`로 맞춘다.
+
+### 처음 작성했을 때의 실수 모음
+
+| 실수 | 증상 | 해결 |
+|---|---|---|
+| `startsWith("bearer")` | 토큰이 항상 인식 안 됨 | `startsWith("Bearer ")` |
+| `getRole`에 null 처리 없음 | RT를 넣으면 NPE → 500 | `role != null ? Role.valueOf(role) : null` |
+| `List.of(...)),` | `illegal start of expression` | 마지막 인자 뒤 쉼표 삭제 |
+| `"ROLE" + role.name()` | 컴파일은 되지만 `hasRole` 불일치 → 403 | `"ROLE_" + role.name()` |
+| `setAuthentication`이 `if` 블록 밖 | `authentication` 변수 범위 밖 → 컴파일 에러 | 같은 블록 안으로 이동 |
+
+### resolveToken — 직접 만든 private 메서드
+
+- 부모(`OncePerRequestFilter`)에 있는 메서드가 아니라 **직접 만든 메서드**다. 그래서 `@Override`가 없다 (붙이면 컴파일 에러)
+- "헤더에서 Bearer 토큰 꺼내기"라는 세부 작업을 분리해서 `doFilterInternal`을 읽기 쉽게 한다 (Provider의 `parseClaims`와 같은 이유)
+
+| 구분법 | `doFilterInternal` | `resolveToken` |
+|---|---|---|
+| 출처 | 부모의 추상 메서드 구현 | 직접 만든 메서드 |
+| `@Override` | O | X |
+
+#### 처음 작성했을 때의 실수 — `startsWith("bearer")`
+
+```java
+if (bearer != null && bearer.startsWith("bearer")) {   // ❌
+```
+
+- 클라이언트는 `Authorization: Bearer eyJhbGc...`로 보낸다
+- `startsWith`는 **대소문자를 구분**하므로 `"Bearer ..."`는 `"bearer"`로 시작하지 않음 → **항상 false** → 모든 요청이 "토큰 없음"으로 처리됨
+- 뒤의 **공백까지** 포함해야 정확하다. `substring(7)`도 `"Bearer "`가 공백 포함 7글자라는 전제
+
+```java
+if (bearer != null && bearer.startsWith("Bearer ")) {  // ✅
+```
+
+> 개선: `7`은 매직 넘버. `private static final String BEARER_PREFIX = "Bearer ";`로 빼고 `substring(BEARER_PREFIX.length())`로 쓰면 글자 수를 셀 필요가 없다.
+
+### 인증 객체 — `UsernamePasswordAuthenticationToken`
+
+```java
+new UsernamePasswordAuthenticationToken(
+        userId,                 // principal   — 누구인지 → "GUEST_a1b2c3d4"
+        null,                   // credentials — 비밀번호 → 토큰으로 이미 검증했으니 null
+        List.of(...)            // authorities — 권한 목록 → [ROLE_GUEST]
+);
+```
+
+| 파라미터 | 의미 | 값 |
+|---|---|---|
+| principal | 인증된 사용자 (Controller에서 "누가 요청했는지" 꺼낼 때 나오는 값) | `userId` |
+| credentials | 비밀번호 등 인증 수단 | `null` |
+| authorities | 권한 목록 | `List.of(new SimpleGrantedAuthority(...))` |
+
+#### 파라미터 3개를 넣어야 "인증 완료"
+
+| 생성자 | 상태 |
+|---|---|
+| `(principal, credentials)` — 2개 | **인증 전** (`isAuthenticated() == false`) — 로그인 시도용 |
+| `(principal, credentials, authorities)` — 3개 | **인증 완료** (`isAuthenticated() == true`) |
+
+2개짜리로 만들어 SecurityContext에 넣으면 **인증되지 않은 사용자로 취급**된다. 권한 목록이 필요 없어 보여도 3개짜리를 써야 하는 이유다.
+
+#### JWT vs `UsernamePasswordAuthenticationToken` — 둘 다 "Token"인데 뭐가 다른가?
+
+이름에 둘 다 Token이 들어가지만 **완전히 다른 것**이다.
+
+| | JWT (Provider가 만듦) | `UsernamePasswordAuthenticationToken` (Filter가 만듦) |
+|---|---|---|
+| 정체 | **문자열** `"eyJhbGc..."` | **Java 객체** (서버 메모리) |
+| 사용 범위 | 클라이언트 ↔ 서버가 주고받음 | 서버 안에서 Spring Security만 사용 |
+| 위치 | 클라이언트 localStorage, 요청 헤더 | `SecurityContextHolder` |
+| 수명 | AT 30분, RT 7일 | **요청 하나가 끝나면 사라짐** |
+| 만드는 시점 | 로그인할 때 한 번 | **요청마다** 매번 |
+| 역할 | "나 이 사람이에요" — 증명서 | "이 요청은 이 사람이 보냄" — 서버 내부 확인 도장 |
+
+비유: JWT는 놀이공원 **입장 팔찌**(입구에서 한 번 받아 계속 차고 다님), `UsernamePasswordAuthenticationToken`은 놀이기구마다 직원이 팔찌를 확인하고 찍어주는 **도장**(그 놀이기구 탈 때만 유효).
+
+```
+[로그인]
+Provider.createAccessToken() → JWT 문자열 → 클라이언트 저장
+
+[API 요청마다]
+Authorization: Bearer {JWT}
+→ Filter: JWT 검증 (Provider)
+→ Filter: new UsernamePasswordAuthenticationToken(userId, null, 권한)   ← JWT 내용으로 생성
+→ SecurityContext에 저장 → 권한 검사, Controller에서 사용
+→ 응답 후 SecurityContext 비워짐 (객체 사라짐)
+```
+
+> **Filter는 JWT를 Spring Security가 이해하는 형식으로 번역한다.** Spring Security는 JWT를 직접 읽지 못하고 `Authentication` 타입 객체만 안다. `UsernamePasswordAuthenticationToken`은 `Authentication`의 구현체다.
+
+**이름이 왜 UsernamePassword인가?** 원래 **아이디/비밀번호 폼 로그인**용으로 만든 클래스라서다. JWT 방식에서는 credentials 자리에 `null`을 넣고 "인증 완료" 상태를 표현하는 용도로 빌려 쓴다 (실무에서 가장 흔한 방식).
+
+### 권한 목록 — `List.of(new SimpleGrantedAuthority("ROLE_" + role.name()))`
+
+```java
+List.of(new SimpleGrantedAuthority("ROLE_" + role.name()))
+│       │                          └── ① "ROLE_GUEST" (문자열)
+│       └── ② 문자열을 권한 객체로 감쌈
+└── ③ 권한 객체를 리스트에 담음
+```
+
+#### ① `"ROLE_" + role.name()` — 권한 이름 만들기
+
+```java
+"ROLE_" + Role.GUEST.name()   // "ROLE_GUEST"
+"ROLE_" + Role.ADMIN.name()   // "ROLE_ADMIN"
+```
+
+Spring Security는 **역할(Role) 권한 이름 앞에 `ROLE_`을 붙이는 규칙**이 있다. `role.name()`은 → "JwtTokenProvider에서 쓴 문법" 섹션 참고.
+
+| SecurityConfig에 쓰는 것 | Spring이 찾는 권한 이름 |
+|---|---|
+| `hasRole("ADMIN")` | `"ROLE_ADMIN"` (`ROLE_` 자동으로 붙임) |
+| `hasAuthority("ROLE_ADMIN")` | `"ROLE_ADMIN"` (그대로) |
+
+`ROLE_`을 빼고 `"ADMIN"`으로 등록하면 `hasRole("ADMIN")`이 `"ROLE_ADMIN"`을 찾다가 **권한 없음(403)**이 된다.
+
+#### ② `new SimpleGrantedAuthority(...)` — 문자열 → 권한 객체
+
+Spring Security는 권한을 문자열이 아니라 **`GrantedAuthority` 타입**으로 다룬다. `SimpleGrantedAuthority`는 그 가장 기본 구현체로, 권한 이름 문자열 하나를 담는다.
+
+#### ③ `List.of(...)` — 리스트에 담기
+
+- 한 사용자가 **권한을 여러 개** 가질 수 있어서, 생성자의 세 번째 파라미터가 컬렉션 타입(`Collection<? extends GrantedAuthority>`)이다. 지금은 사용자당 role이 하나라 원소 1개짜리 리스트
+- `List.of` — Java 9부터 있는 **불변 리스트** 생성 메서드. 만든 뒤 추가/삭제 불가 (`UnsupportedOperationException`)
+
+### SecurityContext에 저장
+
+```java
+SecurityContextHolder.getContext().setAuthentication(authentication);
+```
+
+- `SecurityContextHolder` — 현재 요청(스레드)의 인증 정보를 보관하는 곳
+- 여기에 넣어두면 이후 SecurityConfig의 권한 검사, Controller의 사용자 정보 조회에서 이 값을 사용한다
+- **변수 범위 주의**: `authentication`은 `if (role != null) { }` 안에서 선언했으므로 저장도 **같은 블록 안**에서 해야 한다. 블록 밖에서 쓰면 컴파일 에러
+
+---
+
+## SecurityConfig
+
+Spring Security 설정 클래스다. JWT 방식에 맞게 기본 기능(세션, 폼 로그인 등)을 끄고, **URL별 접근 권한**을 정하고, **JwtAuthenticationFilter를 등록**한다. 이게 있어야 지금까지 만든 JWT 인증이 실제로 동작한다.
+
+### 코드
+
+```java
+@Configuration
+@EnableWebSecurity
+@RequiredArgsConstructor
+public class SecurityConfig {
+
+    private final JwtTokenProvider jwtTokenProvider;
+
+    @Bean
+    public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http.csrf(csrf -> csrf.disable())
+            .sessionManagement(session ->
+                    session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .formLogin(form -> form.disable())
+            .httpBasic(basic -> basic.disable())
+            .authorizeHttpRequests(auth -> auth
+                    .requestMatchers(HttpMethod.POST, "/api/auth/**").permitAll()
+                    .requestMatchers(HttpMethod.GET, "/api/menus/**").permitAll()
+                    .requestMatchers("/", "/login", "/register", "/order", "/order/**",
+                            "/css/**", "/js/**", "/images/**").permitAll()
+                    .anyRequest().authenticated())
+            .addFilterBefore(new JwtAuthenticationFilter(jwtTokenProvider),
+                    UsernamePasswordAuthenticationFilter.class);
+
+        return http.build();
+    }
+
+    @Bean
+    public PasswordEncoder passwordEncoder() {
+        return new BCryptPasswordEncoder();
+    }
+}
+```
+
+### 클래스 레벨
+
+- `@Configuration` — 설정 클래스. 안의 `@Bean` 메서드들이 반환하는 객체를 빈으로 등록
+- `@EnableWebSecurity` — Spring Security 웹 보안 설정 활성화
+- `@RequiredArgsConstructor` — `JwtTokenProvider`를 생성자 주입받음 (빈이므로 주입 성공 → "JwtProperties" 섹션의 생성자 주입 참고)
+
+### `@Bean` vs `@Component`
+
+| | `@Component` | `@Bean` |
+|---|---|---|
+| 붙이는 곳 | **클래스** | `@Configuration` 클래스 안의 **메서드** |
+| 등록되는 것 | 그 클래스의 객체 | 메서드가 **반환하는 객체** |
+| 쓰는 경우 | 내가 만든 클래스 (`JwtTokenProvider`) | 라이브러리 클래스처럼 클래스에 어노테이션을 못 붙일 때, 생성 방식을 직접 정하고 싶을 때 |
+
+`BCryptPasswordEncoder`, `SecurityFilterChain`은 Spring 라이브러리 클래스라 `@Component`를 붙일 수 없다. 그래서 `@Bean` 메서드로 **직접 만들어서** 등록한다.
+
+### 설정 항목별 설명
+
+| 설정 | 의미 | 왜 |
+|---|---|---|
+| `csrf.disable()` | CSRF 보호 끄기 | CSRF는 **브라우저가 쿠키를 자동으로 보내는 것**을 악용하는 공격. JWT는 헤더에 직접 넣어 보내므로 해당 없음 |
+| `SessionCreationPolicy.STATELESS` | 세션을 만들지도 쓰지도 않음 | 로그인 상태를 서버에 저장하지 않고 **JWT로만** 판단 (수평 확장 가능) |
+| `formLogin.disable()` | Spring 기본 로그인 페이지 끄기 | 로그인은 `POST /api/auth/login` API로 직접 구현 |
+| `httpBasic.disable()` | HTTP Basic 인증(브라우저 팝업) 끄기 | 사용하지 않음 |
+| `authorizeHttpRequests` | URL별 접근 권한 | 아래 참고 |
+| `addFilterBefore` | JWT 필터 등록 | 아래 참고 |
+
+### URL별 권한 — `authorizeHttpRequests`
+
+```
+POST /api/auth/**   → permitAll      (회원가입, 로그인, 게스트, 재발급, 로그아웃)
+GET  /api/menus/**  → permitAll      (메뉴는 로그인 전에도 조회)
+페이지·정적 리소스    → permitAll      (/, /login, /register, /order/**, /css/** ...)
+그 외 전부           → authenticated  (인증된 사용자만)
+```
+
+- `requestMatchers(HttpMethod.POST, "/api/auth/**")` — HTTP 메서드 + URL 패턴으로 매칭. 메서드를 생략하면 모든 메서드
+- `**` — 하위 경로 전부 (`/api/auth/login`, `/api/auth/guest` ...)
+- `permitAll()` — 인증 없이 누구나
+- `authenticated()` — SecurityContext에 인증 정보가 있어야 함. 없으면 거부된다
+  - 단, `formLogin`/`httpBasic`을 끄고 별도 설정이 없으면 Spring Security 기본값은 **403**으로 응답한다 (기본 진입점 `Http403ForbiddenEntryPoint`)
+  - "인증 안 됨 = 401", "권한 없음 = 403"으로 구분하려면 `AuthenticationEntryPoint`(401)와 `AccessDeniedHandler`(403)를 직접 등록해야 한다 → 응답도 `ApiResponse` 형식으로 통일 가능
+
+#### 순서가 중요하다
+
+규칙은 **위에서부터** 검사해서 **처음 매칭되는 것**이 적용된다.
+
+```java
+.anyRequest().authenticated()                         // ❌ 맨 위에 두면
+.requestMatchers("/api/menus/**").permitAll()         //    여기까지 오지 않음
+```
+
+그래서 `anyRequest()`는 항상 **맨 마지막**에 둔다 (Spring Security 6은 `anyRequest()` 뒤에 규칙을 추가하면 실행 시 에러를 낸다).
+
+#### Filter와의 연결
+
+> **`.anyRequest().authenticated()`가 JwtAuthenticationFilter와 맞물리는 지점이다.** Filter가 SecurityContext에 인증을 넣었으면 통과, 비어 있으면 여기서 막힌다. "401은 Filter가 아니라 SecurityConfig가 판단한다"는 게 이 부분이다.
+
+### 필터 등록 — `addFilterBefore`
+
+```java
+.addFilterBefore(new JwtAuthenticationFilter(jwtTokenProvider),
+        UsernamePasswordAuthenticationFilter.class);
+```
+
+- "`UsernamePasswordAuthenticationFilter` **앞에** JWT 필터를 끼워 넣어라"
+- 인가(권한) 검사보다 먼저 실행되어야 검사 시점에 SecurityContext가 채워져 있다 (→ "JwtAuthenticationFilter > 필터 체인에서의 위치")
+- `new`로 직접 생성 — Filter에 `@Component`를 안 붙였으므로. 생성자에는 필드로 주입받은 `jwtTokenProvider`를 넘긴다
+
+### PasswordEncoder — BCrypt
+
+```java
+@Bean
+public PasswordEncoder passwordEncoder() {
+    return new BCryptPasswordEncoder();
+}
+```
+
+- 회원가입 시 `passwordEncoder.encode(rawPassword)` → 암호화해서 DB 저장
+- 로그인 시 `passwordEncoder.matches(rawPassword, encodedPassword)` → 비교
+- 반환 타입이 인터페이스(`PasswordEncoder`)라, 나중에 다른 알고리즘으로 바꿔도 사용하는 쪽 코드는 그대로
+
+| | BCrypt | 레거시 (SHA-256 + Salt 직접 구현) |
+|---|---|---|
+| Salt | 자동 생성, 결과 문자열에 포함 | 직접 생성·저장 |
+| 속도 | **일부러 느림** (cost factor) → 무차별 대입 공격에 강함 | 빠름 → 대입 공격에 약함 |
+| 같은 비밀번호 | 매번 **다른** 결과 | Salt가 같으면 같은 결과 |
+
+같은 비밀번호도 매번 결과가 달라서 `encode` 결과끼리 `equals`로 비교하면 안 되고, 반드시 `matches()`로 비교해야 한다.
+
+### 람다식 설정 (Lambda DSL)
+
+```java
+http.csrf(csrf -> csrf.disable())
+```
+
+- `csrf -> csrf.disable()` — **람다식**. "csrf 설정 객체를 받아서 `disable()`을 호출한다"는 함수를 넘기는 것
+- Spring Security 6부터 이 방식만 지원한다. 예전 블로그의 `.csrf().disable().and()...` 체이닝 방식은 제거되어 쓸 수 없다
+
+```java
+// 예전 방식 (Spring Security 5) — 지금은 컴파일 에러
+http.csrf().disable()
+    .sessionManagement().sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+    .and()
+    .authorizeRequests()...
+
+// 현재 방식 (Spring Security 6)
+http.csrf(csrf -> csrf.disable())
+    .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+    .authorizeHttpRequests(auth -> auth...)
+```
+
+> 검색해서 나온 예제가 `.and()`나 `authorizeRequests()`를 쓰면 **옛날 버전 코드**다.
+
+### SecurityConfig에서 쓴 Java 문법
+
+#### ① 람다식 기본 — `매개변수 -> 본문`
+
+```java
+csrf -> csrf.disable()
+│       └── 본문: 받은 객체로 할 일
+└── 매개변수: 메서드가 넘겨주는 설정 객체
+```
+
+람다식은 **이름 없는 메서드를 값처럼 넘기는 문법**이다. `http.csrf(...)`는 "CSRF 설정 객체를 줄 테니, 그걸로 뭘 할지 함수로 알려줘"라는 메서드이고, 우리는 그 함수를 람다로 넘긴다.
+
+```java
+// 람다 없이 쓰면 (익명 클래스) — 같은 의미
+http.csrf(new Customizer<CsrfConfigurer<HttpSecurity>>() {
+    @Override
+    public void customize(CsrfConfigurer<HttpSecurity> csrf) {
+        csrf.disable();
+    }
+});
+
+// 람다로 쓰면
+http.csrf(csrf -> csrf.disable());
+```
+
+- **매개변수 이름은 자유**다. `csrf -> csrf.disable()`를 `c -> c.disable()`로 써도 같다. 읽기 쉽게 설정 이름과 맞추는 관례
+- **타입을 안 써도 된다**. 컴파일러가 `csrf(...)`의 파라미터 타입을 보고 추론한다
+- 본문이 **한 줄**이면 `{}`와 `return`을 생략할 수 있다. 여러 줄이면 `{ ...; }`로 감싼다
+
+#### ② 중첩된 람다와 괄호 범위 — `authorizeHttpRequests`
+
+```java
+.authorizeHttpRequests(auth -> auth                          // ← ( 열림, 람다 시작
+        .requestMatchers(HttpMethod.POST, "/api/auth/**").permitAll()
+        .requestMatchers(HttpMethod.GET, "/api/menus/**").permitAll()
+        .requestMatchers("/", "/login", ...).permitAll()
+        .anyRequest().authenticated())                       // ← ) 닫힘, 람다 끝
+.addFilterBefore(...)                                        // ← 다시 http 체이닝
+```
+
+- `auth -> auth.requestMatchers(...)...anyRequest().authenticated()` 전체가 **하나의 람다 본문**이다
+- `requestMatchers`, `anyRequest`는 `http`가 아니라 **`auth` 객체의 메서드**다
+- `.authenticated())`의 마지막 `)`가 `authorizeHttpRequests(`를 닫는다. 그 뒤의 `.addFilterBefore`는 다시 `http`에 이어지는 체이닝
+- 들여쓰기는 컴파일러가 보지 않는다. **괄호 짝**이 범위를 결정하므로, 람다 안쪽 줄은 한 단계 더 들여써서 구분하는 게 좋다
+
+#### ③ 메서드 참조 — `AbstractHttpConfigurer::disable`
+
+`csrf -> csrf.disable()`처럼 **받은 값으로 메서드 하나만 호출**하는 람다는 메서드 참조로 줄일 수 있다.
+
+```java
+http.csrf(csrf -> csrf.disable())                 // 람다
+http.csrf(AbstractHttpConfigurer::disable)        // 메서드 참조 (같은 의미)
+```
+
+`클래스::메서드` 형태이며, 실무 코드에서 자주 보인다. 둘 다 동작은 같다.
+
+#### ④ 메서드 체이닝과 `http.build()`
+
+```java
+http.csrf(...)                    // HttpSecurity 반환
+    .sessionManagement(...)       // HttpSecurity 반환
+    .formLogin(...)               // HttpSecurity 반환
+    ...
+    .addFilterBefore(...);        // HttpSecurity 반환
+
+return http.build();              // 설정을 바탕으로 SecurityFilterChain 생성
+```
+
+- 각 설정 메서드가 **`http` 자신을 반환**해서 `.`으로 이어 쓸 수 있다 (→ "JwtTokenProvider에서 쓴 문법 > 빌더 패턴 + 메서드 체이닝"과 같은 구조)
+- `HttpSecurity`는 설정을 모으는 **빌더**이고, 마지막 `build()`가 실제 `SecurityFilterChain` 객체를 만든다 (`Jwts.builder()...compact()`와 같은 흐름)
+
+#### ⑤ `throws Exception`
+
+```java
+public SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+```
+
+`http.build()`와 일부 설정 메서드가 `throws Exception`으로 선언돼 있다. 체크 예외라서 **직접 처리(try-catch)하거나 호출한 쪽으로 넘겨야** 하고, 여기서는 넘긴다. 설정 중 예외가 나면 Spring이 받아서 애플리케이션 시작을 실패시킨다.
+
+#### ⑥ 가변 인자 — `requestMatchers(String... patterns)`
+
+```java
+.requestMatchers("/", "/login", "/register", "/order", "/order/**",
+        "/css/**", "/js/**", "/images/**").permitAll()
+```
+
+- `String...`은 **가변 인자**(varargs). 같은 타입의 값을 개수 제한 없이 쉼표로 나열할 수 있다
+- 메서드 안에서는 배열(`String[]`)로 받는다
+- 첫 인자로 `HttpMethod`를 넘기는 버전(`requestMatchers(HttpMethod method, String... patterns)`)도 있다 — 메서드 오버로딩
+
+#### ⑦ 상수와 enum — `HttpMethod.POST`, `SessionCreationPolicy.STATELESS`
+
+```java
+HttpMethod.POST                   // HTTP 메서드 상수
+SessionCreationPolicy.STATELESS   // 세션 정책 enum 상수
+```
+
+문자열 `"POST"`, `"STATELESS"` 대신 **미리 정의된 상수**를 쓴다. 오타가 나면 컴파일 에러로 바로 잡힌다 (`Role.GUEST`를 쓰는 것과 같은 이유).
+
+| 상수 | 의미 |
+|---|---|
+| `SessionCreationPolicy.ALWAYS` | 항상 세션 생성 |
+| `SessionCreationPolicy.IF_REQUIRED` | 필요할 때만 생성 (기본값) |
+| `SessionCreationPolicy.NEVER` | 만들진 않지만 이미 있으면 사용 |
+| `SessionCreationPolicy.STATELESS` | **만들지도 쓰지도 않음** ← JWT |
+
+#### ⑧ 클래스 리터럴 — `UsernamePasswordAuthenticationFilter.class`
+
+```java
+.addFilterBefore(new JwtAuthenticationFilter(jwtTokenProvider),
+        UsernamePasswordAuthenticationFilter.class);
+```
+
+- 첫 번째 인자는 **필터 객체** (`new`로 만든 실제 인스턴스)
+- 두 번째 인자는 **필터의 타입 정보** (`.class`) — "이 종류의 필터 앞에"라는 **위치 기준**만 알려주는 것이라 객체가 필요 없다
+- `클래스명.class`는 → "JwtTokenProvider에서 쓴 문법 > `String.class`란?"과 같은 문법
+
+#### ⑨ 반환 타입을 인터페이스로 — `PasswordEncoder`
+
+```java
+public PasswordEncoder passwordEncoder() {    // 반환 타입: 인터페이스
+    return new BCryptPasswordEncoder();       // 실제 객체: 구현체
+}
+```
+
+- 반환 타입은 **인터페이스**(`PasswordEncoder`), 실제로 만드는 건 **구현체**(`BCryptPasswordEncoder`) — 다형성
+- 이 빈을 주입받는 쪽(`AuthService`)은 `PasswordEncoder` 타입만 알면 된다. 나중에 다른 알고리즘으로 바꿔도 이 메서드 한 줄만 고치면 되고, 사용하는 쪽 코드는 그대로다
