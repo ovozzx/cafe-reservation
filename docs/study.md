@@ -557,6 +557,128 @@ public class User extends BaseTimeEntity { ... }
 
 `private`이 아니라 `protected`인 이유: JPA가 지연 로딩용 프록시 객체를 만들 때 엔티티를 상속하므로 `private`이면 프록시 생성이 안 된다.
 
+```java
+// public 기본 생성자일 때 — 다른 패키지 어디서든 가능
+User user = new User();        // userId, email, password, role 전부 null
+userRepository.save(user);     // → NOT NULL 위반 에러
+```
+
+| 누가 | `new User()` (protected일 때) |
+|---|---|
+| JPA (프록시가 User를 상속) | O |
+| User 클래스 안 (`createGuest()`) | O |
+| AuthService 등 다른 패키지 | X — 컴파일 에러 |
+
+> **`protected`로 막으면 밖에서는 `User.createGuest()` 같은 정적 팩토리 메서드로만 만들 수 있다.** 값이 다 채워진 올바른 객체만 생기도록 강제하는 것이다.
+
+#### `@NoArgsConstructor(access = AccessLevel.PROTECTED)` 뜯어보기
+
+```java
+@NoArgsConstructor(access = AccessLevel.PROTECTED)
+│                  └── 생성자의 접근 제어자를 protected로
+└── 파라미터 없는 생성자(No Args Constructor)를 만들어라
+```
+
+Lombok이 컴파일할 때 아래 코드를 대신 넣어준다.
+
+```java
+protected User() {
+}
+```
+
+- `NoArgs` — 파라미터(arguments)가 **없는** 생성자. 이름 그대로 "기본 생성자"
+- `access = ...` — 어노테이션의 **속성**. `@Column(length = 50)`처럼 `이름 = 값` 형태로 옵션을 지정한다. 생략하면 기본값 `PUBLIC`
+- `AccessLevel.PROTECTED` — Lombok이 제공하는 enum. 만들 생성자의 접근 제어자를 정한다
+
+| `access` 값 | 만들어지는 코드 |
+|---|---|
+| (생략) / `AccessLevel.PUBLIC` | `public User() {}` |
+| `AccessLevel.PROTECTED` | `protected User() {}` ← 엔티티 권장 |
+| `AccessLevel.PACKAGE` | `User() {}` (접근 제어자 없음 = 같은 패키지만) |
+| `AccessLevel.PRIVATE` | `private User() {}` ← JPA 프록시 생성 불가, 엔티티엔 X |
+
+#### 접근 제어자 범위 정리
+
+| 접근 제어자 | 같은 클래스 | 같은 패키지 | 자식 클래스 (다른 패키지) | 그 외 |
+|---|---|---|---|---|
+| `public` | O | O | O | O |
+| `protected` | O | O | O | X |
+| (없음, default) | O | O | X | X |
+| `private` | O | X | X | X |
+
+- `protected`는 **같은 패키지**(`com.cafe.user.entity`)에서도 접근 가능하다. 그래서 정확히는 "다른 패키지의 일반 클래스"(AuthService 등)에서 막힌다
+- JPA 프록시는 User를 **상속한 자식 클래스**라서 `protected`면 부모 생성자를 호출할 수 있다 → `private`은 안 되고 `protected`는 되는 이유
+
+#### 비슷한 Lombok 생성자 어노테이션
+
+| 어노테이션 | 만드는 생성자 | 쓰는 곳 |
+|---|---|---|
+| `@NoArgsConstructor` | 파라미터 없음 | 엔티티 (JPA용) |
+| `@RequiredArgsConstructor` | `final` 필드만 받음 | Service, Filter (생성자 주입) |
+| `@AllArgsConstructor` | 모든 필드를 받음 | 엔티티엔 비권장 (필드 순서가 바뀌면 값이 엉뚱한 필드에 들어가도 컴파일 에러가 안 남) |
+
+> 어노테이션 **순서는 동작에 영향이 없다.** `@Getter`, `@NoArgsConstructor`, `@Entity`, `@Table`을 어떤 순서로 써도 같다. 다만 읽기 좋게 **Lombok끼리 위에, JPA(`@Entity`, `@Table`)는 클래스 선언 바로 위에** 묶는 관례가 많고, 프로젝트 안에서 일관되게 쓰는 게 중요하다.
+
+### @Getter — 왜 필요한가?
+
+필드가 전부 `private`이라 getter가 없으면 **클래스 밖에서 값을 꺼낼 방법이 없다.** AuthService에서는 이런 코드를 쓴다.
+
+```java
+// 로그인
+User user = userRepository.findByEmail(email)...;
+
+passwordEncoder.matches(rawPassword, user.getPassword());      // 비밀번호 비교
+jwtTokenProvider.createAccessToken(user.getUserId(),           // 토큰에 userId
+                                   user.getRole());            //          role
+```
+
+`@Getter`가 없으면 `getPassword()`, `getUserId()`, `getRole()`이 존재하지 않아 **컴파일 에러**다.
+
+- `@Getter`만 붙이고 `@Setter`는 붙이지 않는다 → 꺼내기만 가능, 변경은 `updateRefreshToken()` 같은 의도가 드러나는 메서드로만 (→ 아래 "setter 대신 의도가 드러나는 메서드")
+
+| 어노테이션 | 없으면? | 붙이면? |
+|---|---|---|
+| `@Getter` | AuthService에서 `getUserId()` 등 못 씀 → 컴파일 에러 | 값 꺼내기 가능 (변경은 불가) |
+| `@NoArgsConstructor(access = PROTECTED)` | 동작은 하지만 어디서든 빈 User 생성 가능 | JPA만 쓰고, 밖에서는 팩토리 메서드로만 생성 |
+
+### 엔티티에 `@Data`를 쓰면 안 되는 이유
+
+`@Data`는 `@Getter`보다 훨씬 많은 걸 한 번에 만든다.
+
+```java
+@Data = @Getter + @Setter + @ToString + @EqualsAndHashCode + @RequiredArgsConstructor
+```
+
+| 같이 생기는 것 | 엔티티에서의 문제 |
+|---|---|
+| `@Setter` | `user.setRole(Role.ADMIN)`, `user.setUserId(...)` — **누구나 아무 필드나 변경 가능**. PK까지 바뀔 수 있음. 막으려던 바로 그것 |
+| `@ToString` | 모든 필드 출력 → 로그에 **password, refreshToken이 그대로** 찍힐 수 있음. 연관관계가 생기면 서로를 계속 출력하다 **무한 루프(StackOverflowError)** |
+| `@EqualsAndHashCode` | 모든 필드로 비교 → 값이 바뀌면 hashCode도 바뀌어 `Set`/`Map`에서 객체를 잃어버림. JPA 프록시와 비교할 때도 오동작 |
+| `@RequiredArgsConstructor` | `final` 필드가 없으면 결국 **`public` 기본 생성자** → `protected`로 막은 효과가 사라짐 |
+
+> **엔티티에는 `@Data` 대신 필요한 것만 골라 붙인다:** `@Getter` + `@NoArgsConstructor(access = AccessLevel.PROTECTED)`. `@Data`는 가변 DTO처럼 데이터만 담고 로직·연관관계가 없는 클래스에나 쓴다 (→ "Java record > record vs @Data").
+
+### 처음 작성했을 때의 실수 — `@Getter` 대신 `@Data`
+
+```java
+@Data           // ❌
+@Entity
+@Table(name = "users")
+public class User extends BaseTimeEntity { ... }
+```
+
+- 컴파일은 **통과**한다 — `@RequiredArgsConstructor`가 `final` 필드가 없어서 기본 생성자를 만들기 때문에 `new User()`도 된다
+- 그래서 에러 없이 지나가지만, 위 표의 문제(setter 공개, 민감 정보 로그 노출, equals/hashCode 오동작, public 생성자)가 전부 숨어 있다
+- **해결**: `@Data`와 `import lombok.Data;` 삭제 →
+
+```java
+@Getter
+@NoArgsConstructor(access = AccessLevel.PROTECTED)
+@Entity
+@Table(name = "users")
+public class User extends BaseTimeEntity { ... }
+```
+
 ### 정적 팩토리 메서드 (createGuest)
 
 ```java
