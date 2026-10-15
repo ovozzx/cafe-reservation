@@ -2,7 +2,14 @@ package com.cafe.user.entity;
 
 import com.cafe.global.entity.BaseTimeEntity;
 import jakarta.persistence.*;
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
 
+import java.util.UUID;
+
+@Getter
+@NoArgsConstructor(access = AccessLevel.PROTECTED)
 @Entity
 @Table(name = "users")
 public class User extends BaseTimeEntity {
@@ -26,7 +33,19 @@ public class User extends BaseTimeEntity {
 
     public static User createGuest() {
         User user = new User();
+        user.userId = "GUEST_" + UUID.randomUUID().toString();
+        user.email = user.userId + "@guest.local";
+        user.password = UUID.randomUUID().toString();
+        user.role = Role.GUEST;
         return user;
+    }
+
+    public void updateRefreshToken(String refreshToken){
+        this.refreshToken = refreshToken;
+    }
+
+    public boolean isGuest(){
+        return this.role == Role.GUEST;
     }
 
 }
