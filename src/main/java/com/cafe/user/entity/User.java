@@ -40,6 +40,15 @@ public class User extends BaseTimeEntity {
         return user;
     }
 
+    public static User create(String userId, String email, String encodedPassword){
+        User user = new User();
+        user.userId = userId;
+        user.email = email;
+        user.password = encodedPassword;
+        user.role = Role.USER;
+        return user;
+    }
+
     public void updateRefreshToken(String refreshToken){
         this.refreshToken = refreshToken;
     }
