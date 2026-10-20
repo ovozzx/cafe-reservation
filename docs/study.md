@@ -113,7 +113,7 @@ Docker Desktop이 실행 중이어야 한다. 실행되지 않으면 `Cannot con
 
 ## Java record
 
-Java 14에서 추가된 기능으로, **불변 데이터 객체**를 간결하게 만드는 문법이다. DTO처럼 데이터만 담는 객체에 적합하다.
+Java 16에서 정식 추가된 기능으로 (14·15는 프리뷰), **불변 데이터 객체**를 간결하게 만드는 문법이다. DTO처럼 데이터만 담는 객체에 적합하다.
 
 ### 비교
 
@@ -145,9 +145,54 @@ public class ApiResponse<T> {
 - getter (필드명과 동일한 메서드: `success()`, `data()` 등)
 - `equals`, `hashCode`, `toString`
 
+### `()` 안에 쓴 것 = 멤버 변수 (record component)
+
+> **"record는 멤버 변수를 `()` 안으로 받아?" → 맞다.** `()` 안에 쓴 것을 **컴포넌트**(record component)라고 부르고, 이것 하나로 필드·생성자 파라미터·접근자가 한 번에 만들어진다.
+
+```java
+public record TokenRequest(@NotBlank String refreshToken) {}
+```
+
+컴파일러가 실제로 만들어주는 코드:
+
+```java
+public final class TokenRequest {
+    private final String refreshToken;              // ← () 안에 쓴 게 private final 필드
+
+    public TokenRequest(String refreshToken) {      // ← 모든 컴포넌트를 받는 생성자
+        this.refreshToken = refreshToken;
+    }
+
+    public String refreshToken() { return refreshToken; }   // ← 접근자 (get 접두사 없음)
+
+    // equals(), hashCode(), toString()도 자동 생성
+}
+```
+
+#### `()`와 `{}`에 각각 넣을 수 있는 것
+
+| 위치 | 넣을 수 있는 것 | 못 넣는 것 |
+|---|---|---|
+| `()` 헤더 | 컴포넌트(= 인스턴스 필드), 컴포넌트에 붙이는 어노테이션 | — |
+| `{}` 본문 | 메서드, `static` 필드, `static` 메서드(정적 팩토리), 생성자 검증 로직 | **인스턴스 필드** (`private String foo;` → 컴파일 에러) |
+
+- 인스턴스 필드는 **반드시 `()` 안에만** 선언한다. `JwtProperties`를 처음 만들 때 본문에 필드를 적어서 컴파일 에러가 났던 게 이 규칙 때문이다 (→ "JwtProperties" 섹션의 실수).
+- `TokenResponse.guest(accessToken)` 같은 정적 팩토리는 `static` 메서드라 본문 `{}`에 넣을 수 있다.
+
+#### 검증 어노테이션도 `()` 안의 컴포넌트에 붙인다
+
+```java
+public record LoginRequest(
+        @NotBlank String userId,      // ← 컴포넌트에 직접 붙임
+        @NotBlank String password
+) {}
+```
+
+컴포넌트에 붙인 어노테이션은 컴파일러가 생성되는 필드·생성자 파라미터 등으로 전달해준다. 그래서 따로 필드를 선언하지 않아도 Bean Validation이 검사할 수 있다. (실제 검사는 Controller에서 `@Valid @RequestBody`를 붙여야 동작한다.)
+
 ### 특징
 - 필드가 `final`이라 한번 만들면 수정 불가 (불변)
-- Java 14부터 지원, 현재 프로젝트(Java 17)에서 사용 가능
+- Java 14·15는 프리뷰(`--enable-preview` 필요), **Java 16부터 정식** (JEP 395). 현재 프로젝트(Java 17, LTS)에서 바로 사용 가능
 
 ### record vs @Data (Lombok)
 
@@ -197,6 +242,38 @@ JwtProperties changed = new JwtProperties("새secret", props.accessTokenExpirati
 #### `new`를 꼭 내가 부르는 건 아니다
 
 `JwtProperties`는 코드에서 `new`를 쓴 적이 없다. Spring이 설정 파일 값을 읽어 **대신 `new JwtProperties(...)`를 호출**한다 (생성자 바인딩 → "JwtProperties" 섹션). 누가 만들든 **생성 시점에 값이 정해지고 이후 못 바꾸는 건** 같다.
+
+#### setter를 직접 만들어도 값은 못 바꾼다
+
+> **"record도 setter가 만들어져?" → 아니다.** 자동으로 만들어지는 건 접근자(`refreshToken()`)뿐이다.
+
+본문 `{}`에 setter를 직접 써도, 필드가 `final`이라 재대입하는 줄에서 컴파일 에러가 난다.
+
+```java
+public record TokenRequest(String refreshToken) {
+    public void setRefreshToken(String refreshToken) {
+        this.refreshToken = refreshToken;   // ❌ cannot assign a value to final variable refreshToken
+    }
+}
+```
+
+#### 요청 DTO(record)에 JSON 값이 들어가는 방법 — Jackson이 생성자를 호출
+
+`@RequestBody`로 받은 JSON을 객체로 바꾸는 건 Jackson이 한다. 일반 클래스와 record는 값을 넣는 방식이 다르다.
+
+```
+[일반 클래스 DTO]  기본 생성자로 빈 객체 생성 → setter로 필드를 하나씩 채움
+[record DTO]       setter가 없음 → 생성자에 모든 값을 한 번에 넣어서 생성
+
+요청 JSON {"refreshToken": "abc"}
+→ Jackson이 new TokenRequest("abc") 호출
+→ 만들어진 뒤로는 값 변경 불가
+```
+
+- Jackson 2.12부터 record를 지원하고, Spring Boot 3 이상(현재 프로젝트는 4.0)에서는 별도 설정 없이 동작한다.
+- JSON 키 이름과 컴포넌트 이름(`refreshToken`)이 같아야 값이 들어간다. JSON에 없는 키는 `null`(숫자 기본형은 `0`)로 들어가고, 그래서 `@NotBlank` 같은 검증이 필요하다.
+
+`JwtProperties`를 Spring이 생성자로 만드는 것과 같은 원리다 — **값을 다 모은 뒤 생성자로 한 번에 만든다.**
 
 #### 주의: "얕은" 불변이다
 
@@ -371,6 +448,80 @@ ErrorCode.INVALID_CREDENTIALS.getStatus()  // 401
 - `INVALID_CREDENTIALS`는 메서드가 아니라 enum **상수** (ErrorCode 타입의 고정된 인스턴스). 내부적으로 `new ErrorCode("AUTH_001", "...", 401)`과 같지만, enum은 `new`로 직접 생성할 수 없고 선언된 상수만 사용 가능
 - `@RequiredArgsConstructor` 덕분에 `("AUTH_001", "...", 401)` 형태로 값을 넣을 수 있다
 - `@Getter` 덕분에 `getCode()`, `getMessage()`, `getStatus()`를 직접 작성하지 않아도 된다
+
+### enum 두 가지 형태 — Role vs ErrorCode
+
+> **"enum 파일마다 코드가 달라 보이는데?" → 이름만 있는 enum과, 상수마다 데이터를 가진 enum의 차이다.**
+
+#### 이름만 있는 enum (Role)
+
+```java
+public enum Role {
+    USER, ADMIN, GUEST          // ← 상수 이름 자체가 의미의 전부, 끝의 ; 생략 가능
+}
+```
+
+- 종류만 구분하면 되므로 필드·생성자가 없다
+- 사용: `Role.USER`, `role.name()` → `"USER"` (→ "JwtTokenProvider에서 쓴 문법" 섹션)
+
+#### 상수마다 데이터를 가진 enum (ErrorCode)
+
+```java
+@Getter
+@RequiredArgsConstructor
+public enum ErrorCode {
+    INVALID_INPUT("COMMON_001", "잘못된 입력값입니다.", 400),            // ← 생성자 호출, 상수 사이는 ,
+    INTERNAL_ERROR("COMMON_002", "서버 내부 오류가 발생했습니다.", 500);  // ← 상수 목록 끝은 ; (필수)
+
+    private final String code;      // ← ; 뒤부터는 일반 클래스처럼 필드·메서드 작성
+    private final String message;
+    private final int status;
+}
+```
+
+- 에러 하나에 이름 외에도 **코드·메시지·HTTP 상태**가 함께 필요하므로 필드를 둔다
+- 상수 옆 괄호 `("COMMON_001", ...)`는 **생성자 호출**이다. enum 상수 하나가 곧 객체 하나다
+- 사용: `ErrorCode.INVALID_INPUT.getStatus()` → `400`
+
+#### 두 형태 모두 "상수 = 객체"다 (문자열이 아니다)
+
+> **"1번은 상수가 곧 문자열 값이고, 2번은 상수마다 데이터를 여러 개 가지는 거?" → 2번은 맞다. 1번은 문자열이 아니라 Role 타입 객체이고, 문자열은 `name()`으로 꺼낼 때만 생긴다.**
+
+```java
+Role role = Role.USER;          // ← Role 객체
+String s = role.name();         // ← "USER" (이때 문자열이 됨)
+
+String x = Role.USER;           // ❌ 컴파일 에러 — Role을 String에 넣을 수 없음
+Role.USER.equals("USER");       // false — 타입이 다름
+```
+
+| | 상수의 정체 | 가진 데이터 |
+|---|---|---|
+| Role | Role 객체 | 없음 — 이름(`name()`)만 |
+| ErrorCode | ErrorCode 객체 | code, message, status |
+
+- **왜 문자열 대신 enum인가?** `String role = "USR"` 같은 오타는 컴파일러가 못 잡지만, `Role.USR`은 컴파일 에러가 난다. 쓸 수 있는 값이 선언된 상수로 제한된다.
+- **DB에서 문자열로 보이는 이유**: `@Enumerated(EnumType.STRING)`이 저장할 때 `name()` 값(`"USER"`)을 컬럼에 넣고, 읽을 때 `Role.valueOf("USER")`로 다시 객체로 바꾼다 (→ "JPA 엔티티 (User)" 섹션의 `@Enumerated`).
+
+#### 상수 목록 끝의 `;`
+
+```
+상수1(...),
+상수2(...);          ← 여기서 상수 목록이 끝났다고 알림
+필드, 생성자, 메서드  ← 일반 클래스 영역
+```
+
+상수 뒤에 필드가 오므로 컴파일러가 상수의 끝을 알 수 있게 `;`가 **필수**다. 그래서 상수를 추가할 때는 기존 마지막 상수의 `;`를 `,`로 바꾸고, **새 마지막 상수 뒤에** `;`를 둔다.
+
+#### 비교
+
+| | Role | ErrorCode |
+|---|---|---|
+| 상수 형태 | `USER` | `INVALID_INPUT("COMMON_001", "...", 400)` |
+| 필드 | 없음 | code, message, status |
+| 생성자 | 없음 (기본) | `@RequiredArgsConstructor`가 생성 |
+| 상수 끝 `;` | 생략 가능 | **필수** |
+| 용도 | 종류 구분 | 종류 + 종류별 정보 |
 
 ---
 
@@ -886,6 +1037,32 @@ jwtProperties.accessTokenExpiration()   // 1800000
 
 - record는 `get` 접두사가 **없다**. `jwtProperties.getSecret()`이라고 쓰면 컴파일 에러
 - 필드는 `private final`이라 `jwtProperties.secret`처럼 필드에 직접 접근은 불가능하고, 반드시 메서드로 꺼낸다
+
+#### 요청 DTO(record)에서도 같다 — Service에서 두 방식이 섞인다
+
+> **record 값을 꺼낼 때는 `request.getUserId()`가 아니라 `request.userId()`다.** getter에 `get` 접두사가 없다.
+
+`AuthService`에서는 record인 요청 DTO와 Lombok `@Getter`를 쓴 엔티티를 함께 다루므로, 한 메서드 안에서 두 방식이 섞인다.
+
+```java
+public void register(RegisterRequest request) {          // RegisterRequest = record
+    userRepository.existsById(request.userId());         // ← record: userId()
+    passwordEncoder.encode(request.password());          // ← record: password()
+    ...
+}
+
+User user = userRepository.findById(...).orElseThrow(...); // User = 엔티티 + @Getter
+user.getUserId();                                        // ← Lombok: getUserId()
+user.getRole();
+```
+
+| 대상 | 종류 | 꺼내는 방법 |
+|---|---|---|
+| `RegisterRequest`, `LoginRequest`, `TokenRequest`, `JwtProperties` | record | `request.userId()` |
+| `User`, `ErrorCode` | Lombok `@Getter` | `user.getUserId()`, `errorCode.getMessage()` |
+
+- `request.getUserId()`라고 쓰면 그런 메서드가 없어서 `cannot find symbol` 컴파일 에러가 난다
+- 헷갈리면 **"record면 필드명 그대로, `@Getter`면 get + 필드명"**으로 구분한다
 
 ### `role.name()` — enum 상수 이름을 문자열로
 
@@ -1777,7 +1954,7 @@ GET  /api/menus/**  → permitAll      (메뉴는 로그인 전에도 조회)
 .requestMatchers("/api/menus/**").permitAll()         //    여기까지 오지 않음
 ```
 
-그래서 `anyRequest()`는 항상 **맨 마지막**에 둔다 (Spring Security 6은 `anyRequest()` 뒤에 규칙을 추가하면 실행 시 에러를 낸다).
+그래서 `anyRequest()`는 항상 **맨 마지막**에 둔다 (Spring Security 6부터는 `anyRequest()` 뒤에 규칙을 추가하면 실행 시 에러를 낸다).
 
 #### Filter와의 연결
 
@@ -1831,7 +2008,7 @@ http.csrf().disable()
     .and()
     .authorizeRequests()...
 
-// 현재 방식 (Spring Security 6)
+// 현재 방식 (Spring Security 6 이상, 현재 프로젝트는 7)
 http.csrf(csrf -> csrf.disable())
     .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
     .authorizeHttpRequests(auth -> auth...)
@@ -1966,3 +2143,154 @@ public PasswordEncoder passwordEncoder() {    // 반환 타입: 인터페이스
 
 - 반환 타입은 **인터페이스**(`PasswordEncoder`), 실제로 만드는 건 **구현체**(`BCryptPasswordEncoder`) — 다형성
 - 이 빈을 주입받는 쪽(`AuthService`)은 `PasswordEncoder` 타입만 알면 된다. 나중에 다른 알고리즘으로 바꿔도 이 메서드 한 줄만 고치면 되고, 사용하는 쪽 코드는 그대로다
+
+---
+
+## @Transactional (readOnly)
+
+메서드 하나를 **트랜잭션 하나로 묶는** 어노테이션이다. 메서드가 정상 종료되면 커밋, 중간에 예외(RuntimeException)가 나면 전부 롤백한다. JPA의 변경 감지도 트랜잭션 안에서만 동작한다 (→ "JPA 엔티티 (User)" 섹션의 "변경 감지").
+
+### 코드
+
+```java
+@Service
+@RequiredArgsConstructor
+@Transactional(readOnly = true)   // ← 클래스 기본값: 모든 메서드를 읽기 전용 트랜잭션으로
+public class AuthService {
+
+    @Transactional                // ← 이 메서드만 쓰기 가능 (readOnly = false로 덮어씀)
+    public void register(RegisterRequest request) {
+        // existsById 조회 → save(user)
+    }
+}
+```
+
+```
+register() 시작 → 트랜잭션 시작
+  ├ existsById 조회
+  ├ save(user)
+  └ 예외 발생 시 → 전부 롤백
+register() 정상 종료 → 커밋
+```
+
+- `@Transactional` — 메서드를 트랜잭션으로 실행 (기본 `readOnly = false`)
+- `@Transactional(readOnly = true)` — 읽기 전용 트랜잭션으로 실행
+- **메서드에 붙은 설정이 클래스 설정보다 우선한다**
+
+### readOnly = true의 효과
+
+| 효과 | 설명 |
+|---|---|
+| 변경 감지 생략 | 엔티티 스냅샷 비교를 하지 않아 조회가 가벼워진다 |
+| flush 안 함 | 엔티티 값을 바꿔도 DB에 반영하지 않는다 |
+| 의도 표시 | "이 메서드는 조회 전용"이라는 걸 코드로 드러낸다 |
+
+### "읽기만 된다?" — 쓰기를 에러로 막아주는 건 아니다
+
+> **readOnly는 "읽기 전용으로 동작하게 하는 설정"이지, 쓰기를 확실히 차단하는 안전장치가 아니다.** 쓰기를 시도하면 에러 없이 무시될 수 있다.
+
+| readOnly 트랜잭션 안에서 | 결과 |
+|---|---|
+| 조회 (`findById`, `existsById`) | ✅ 정상 |
+| 엔티티 값 변경 (`user.updateRefreshToken(...)`) | ⚠️ 에러 없이 DB에 반영 안 됨 (변경 감지·flush를 안 하므로) |
+| `save()` | ⚠️ 조용히 저장이 안 되거나, DB 연결이 read-only라 에러가 나는 등 상황에 따라 다름 |
+
+```java
+@Transactional(readOnly = true)
+public class AuthService {
+
+    public void register(...) {      // ← @Transactional을 깜빡함 → 클래스의 readOnly를 따라감
+        userRepository.save(user);   // ← 회원이 저장되지 않을 수 있음
+    }
+}
+```
+
+**쓰기 메서드에는 반드시 메서드 레벨 `@Transactional`을 붙인다.** "응답은 200인데 DB에 데이터가 없다"면 가장 먼저 의심할 부분이다.
+
+### 왜 클래스에 readOnly를 기본으로 거는가?
+
+안전한 쪽(읽기 전용)을 기본값으로 두고, 저장·수정이 필요한 메서드만 열어주는 실무 패턴이다. `AuthService`는 회원가입·로그인(RT 저장)·게스트·재발급·로그아웃이 모두 DB에 쓰므로 결국 전부 `@Transactional`이 붙지만, 나중에 조회 메서드가 추가될 때를 대비해 이 패턴을 유지한다.
+
+### 클래스에 걸면 내부 메서드는 어떻게 되는가?
+
+> **"서비스 자체에 트랜잭션을 설정하면 내부 메서드는 어떻게 돼?" → 외부에서 호출 가능한 메서드마다 클래스 설정이 똑같이 붙는다. 단, private 메서드와 같은 클래스 안의 내부 호출에는 어노테이션이 적용되지 않고, 호출한 쪽의 트랜잭션을 그대로 따라간다.**
+
+#### 1. 메서드마다 클래스 설정이 기본으로 적용된다
+
+```java
+@Transactional(readOnly = true)
+public class AuthService {
+    public void a() { }              // ← readOnly = true (클래스 설정)
+
+    @Transactional
+    public void register() { }       // ← readOnly = false (메서드 설정이 우선)
+}
+```
+
+- 클래스에 붙인 설정 = 모든 메서드에 똑같이 붙인 것
+- 적용 대상은 외부에서 호출 가능한 메서드다. 기본은 `public`이고, Spring 6부터는 클래스 기반 프록시에서 `protected`·package-private도 적용된다
+- **`private` 메서드에는 적용되지 않는다.** 다만 private 메서드는 호출한 메서드의 트랜잭션 안에서 실행되므로 신경 쓸 필요는 없다
+
+#### 2. 프록시가 트랜잭션을 처리한다
+
+`@Transactional`은 Spring이 `AuthService`를 감싸서 만든 **프록시 객체**가 처리한다. Controller가 주입받는 건 진짜 `AuthService`가 아니라 이 프록시다.
+
+```
+Controller → [프록시] 트랜잭션 시작 → 진짜 AuthService.register() → [프록시] 커밋/롤백
+```
+
+프록시는 **바깥에서 들어오는 호출만** 가로챌 수 있다. private 메서드는 바깥에서 부를 수 없으니 가로챌 기회가 없다.
+
+#### 3. ⚠️ 같은 클래스 안에서 다른 메서드를 호출하면 (self-invocation)
+
+```java
+@Transactional(readOnly = true)
+public class AuthService {
+
+    public void signupAndLogin(...) {   // ← 바깥에서 호출됨 → readOnly 트랜잭션
+        register(...);                  // ← this.register() — 프록시를 거치지 않음
+    }
+
+    @Transactional
+    public void register(...) { save(...); }   // ← 이 @Transactional은 무시됨
+}
+```
+
+- 내부 호출은 프록시를 거치지 않으므로 `register()`의 `@Transactional`이 **무시**된다
+- `register()`는 호출한 쪽의 readOnly 트랜잭션 안에서 실행되어 **저장이 안 될 수 있다** (→ 위 "읽기만 된다?")
+
+> **트랜잭션 설정은 "바깥에서 처음 들어온 메서드" 기준으로 정해진다.** 내부 호출은 그 트랜잭션을 그대로 따라간다.
+
+#### 4. Repository 호출은 기존 트랜잭션에 참여한다
+
+`userRepository.save()` 같은 Repository 메서드에도 `@Transactional`이 붙어 있다. 이미 Service에서 트랜잭션이 시작됐다면 **새로 만들지 않고 거기에 참여**한다 (전파 속성 `REQUIRED`의 기본 동작). 그래서 `register()` 안의 `existsById`와 `save`는 하나의 트랜잭션으로 묶인다.
+
+#### 정리
+
+| 호출 방식 | 메서드의 `@Transactional` | 실제 트랜잭션 |
+|---|---|---|
+| 외부(Controller) → public 메서드 | 적용됨 | 그 메서드의 설정 (없으면 클래스 설정) |
+| 같은 클래스 → private 메서드 | 적용 안 됨 | 호출한 메서드의 트랜잭션 |
+| 같은 클래스 → public 메서드 (`this.xxx()`) | **무시됨** | 호출한 메서드의 트랜잭션 |
+| Service → Repository | 적용됨 (`REQUIRED`) | Service 트랜잭션에 참여 |
+
+이 프로젝트는 Controller가 `AuthService` 메서드를 하나씩 직접 호출하는 구조라 3번 문제가 생길 일은 거의 없다. **쓰기 메서드마다 `@Transactional`을 붙이고, 같은 클래스의 public 메서드끼리 서로 호출하지 않는다.**
+
+### 처음 작성했을 때의 실수 — import 패키지
+
+`@Transactional`이 두 패키지에 있어서 자동완성으로 다른 쪽이 들어갔다.
+
+| 패키지 | `readOnly` 속성 | 비고 |
+|---|---|---|
+| `org.springframework.transaction.annotation.Transactional` | **있음** | Spring 것. 이걸 쓴다 |
+| `jakarta.transaction.Transactional` | 없음 | JTA 표준. `readOnly`를 쓰면 컴파일 에러 |
+
+```
+error: cannot find symbol
+  symbol:   method readOnly()
+  location: @interface Transactional
+```
+
+- **원인**: `jakarta.transaction.Transactional`에는 `readOnly` 속성이 없다
+- **해결**: `import org.springframework.transaction.annotation.Transactional;`로 바꾼다
+- 함께 들어간 `io.swagger.v3.oas.annotations.servers.Server`도 `@Service`를 치다가 자동완성으로 잘못 들어간 import라 삭제한다. import를 지우기만 하고 새로 넣지 않으면 `cannot find symbol ... class Transactional` 에러가 난다.
