@@ -1045,13 +1045,14 @@ jwtProperties.accessTokenExpiration()   // 1800000
 `AuthService`에서는 record인 요청 DTO와 Lombok `@Getter`를 쓴 엔티티를 함께 다루므로, 한 메서드 안에서 두 방식이 섞인다.
 
 ```java
-public void register(RegisterRequest request) {          // RegisterRequest = record
-    userRepository.existsById(request.userId());         // ← record: userId()
-    passwordEncoder.encode(request.password());          // ← record: password()
-    ...
-}
+// 실제 AuthService.register() — RegisterRequest = record
+userRepository.existsByEmail(registerRequest.email());                    // ← record: email()
+String encodedPassword = passwordEncoder.encode(registerRequest.password());  // ← record: password()
+User user = User.create(registerRequest.userId(), registerRequest.email(), encodedPassword);
+//                                     ↑ record: userId() — get 없음
 
-User user = userRepository.findById(...).orElseThrow(...); // User = 엔티티 + @Getter
+// login()에서 엔티티를 다룰 때 — User = 엔티티 + @Getter
+User user = userRepository.findById(...).orElseThrow(...);
 user.getUserId();                                        // ← Lombok: getUserId()
 user.getRole();
 ```
@@ -2294,3 +2295,194 @@ error: cannot find symbol
 - **원인**: `jakarta.transaction.Transactional`에는 `readOnly` 속성이 없다
 - **해결**: `import org.springframework.transaction.annotation.Transactional;`로 바꾼다
 - 함께 들어간 `io.swagger.v3.oas.annotations.servers.Server`도 `@Service`를 치다가 자동완성으로 잘못 들어간 import라 삭제한다. import를 지우기만 하고 새로 넣지 않으면 `cannot find symbol ... class Transactional` 에러가 난다.
+
+---
+
+## Spring Data JPA 쿼리 메서드 (메서드 이름으로 쿼리 만들기)
+
+Repository 인터페이스에 **규칙에 맞는 이름**으로 메서드를 선언하면, Spring Data JPA가 이름을 해석해서 JPQL을 자동으로 만든다. 구현 코드나 SQL을 쓰지 않는다.
+
+### 코드
+
+```java
+public interface UserRepository extends JpaRepository<User, String> {
+    boolean existsByEmail(String email);   // ← 직접 추가 → SELECT ... WHERE email = ? (있으면 true)
+    // userId 중복 → existsById (기본 제공)
+    // 로그인 조회 → findById (기본 제공)
+}
+```
+
+### 이름 구조
+
+```
+[접두사] + By + [조건 필드] + [조건 키워드] + (And/Or + 조건 ...)
+ exists    By    Email
+ find      By    Role      And   Email   Containing
+```
+
+#### 1. 접두사 — 무엇을 할지
+
+| 접두사 | 하는 일 | 반환 타입 예 |
+|---|---|---|
+| `find…By`, `get…By`, `read…By`, `query…By` | 조회 | `Optional<User>`, `List<User>` |
+| `exists…By` | 존재 여부 | `boolean` |
+| `count…By` | 개수 | `long` |
+| `delete…By`, `remove…By` | 삭제 | `void`, `long` |
+
+#### 2. 조건 필드 — `By` 뒤에는 엔티티 **필드명**
+
+> **"By 뒤에는 필드명과 일치해야 해?" → 맞다.** DB 컬럼명이 아니라 **엔티티의 필드명**이고, 첫 글자만 대문자로 바꾼다.
+
+```java
+// User 엔티티
+private String userId;      // 컬럼명은 user_id
+private String email;
+```
+
+| 메서드 | 결과 |
+|---|---|
+| `existsByEmail` | ✅ `email` 필드 |
+| `findByUserId` | ✅ `userId` 필드 |
+| `findByUser_id` | ❌ DB 컬럼명(`user_id`)은 안 된다 |
+| `existsByMail` | ❌ `mail` 필드가 없음 → `No property 'mail' found for type 'User'` |
+
+- **파라미터 이름은 상관없다.** `existsByEmail(String e)`도 된다. 조건과 파라미터는 이름이 아니라 **순서·타입**으로 매칭된다
+- **이름이 틀려도 컴파일은 통과한다.** 메서드 이름은 컴파일러가 검사하지 않고, Spring이 **앱 실행 시점**에 해석하다가 에러를 낸다. Repository에 메서드를 추가하면 앱을 한 번 띄워 확인한다
+- **연관 엔티티의 필드도 따라갈 수 있다.** `Order`가 `User user` 필드를 가지면 `findByUserUserId(userId)` → `order.user.userId`로 조회. 경계가 모호하면 `findByUser_UserId`처럼 `_`로 구분한다
+
+#### 3. 조건 키워드
+
+| 키워드 | 예시 | SQL |
+|---|---|---|
+| (없음) | `findByEmail(e)` | `email = ?` |
+| `And` / `Or` | `findByUserIdAndEmail(id, e)` | `user_id = ? AND email = ?` |
+| `Not` | `findByRoleNot(r)` | `role <> ?` |
+| `IsNull` / `IsNotNull` | `findByRefreshTokenIsNull()` | `refresh_token IS NULL` |
+| `In` | `findByRoleIn(List<Role>)` | `role IN (...)` |
+| `Containing` | `findByEmailContaining("gmail")` | `email LIKE '%gmail%'` |
+| `StartingWith` | `findByUserIdStartingWith("GUEST_")` | `user_id LIKE 'GUEST_%'` |
+| `GreaterThan` / `LessThan` / `Before` / `After` / `Between` | `findByCreatedAtBefore(t)` | `created_at < ?` |
+| `OrderBy…Asc/Desc` | `findByRoleOrderByCreatedAtDesc(r)` | `… ORDER BY created_at DESC` |
+| `First` / `Top` | `findFirstByOrderByCreatedAtDesc()` | `LIMIT 1` |
+
+### 기본 제공 메서드 — 만들지 않아도 있다
+
+`JpaRepository<User, String>`을 상속하면 아래는 선언 없이 바로 쓴다.
+
+| 메서드 | 이 프로젝트에서의 용도 |
+|---|---|
+| `findById(id)` → `Optional<User>` | 로그인 시 userId로 조회 |
+| `existsById(id)` → `boolean` | 회원가입 시 userId 중복 확인 |
+| `save(entity)` | 저장 / 수정 |
+| `findAll()`, `count()`, `deleteById(id)` | 전체 조회, 개수, 삭제 |
+
+### 왜 MyBatis처럼 이름을 마음대로 지으면 안 되는가?
+
+MyBatis는 메서드 이름이 XML의 SQL id와 연결될 뿐이라 이름을 자유롭게 짓는다. JPA 쿼리 메서드는 **이름 자체가 쿼리**라서, 규칙에 없는 이름은 해석할 수 없다.
+
+| | MyBatis | Spring Data JPA 쿼리 메서드 |
+|---|---|---|
+| SQL 위치 | XML/어노테이션에 직접 작성 | 메서드 이름에서 자동 생성 |
+| 메서드 이름 | 자유 (`selectCountById`) | 규칙 필수 (`existsById`, `countById`) |
+| 잘못된 이름 | SQL id 매칭 실패 | 앱 실행 시 `No property ... found` |
+
+### 처음 작성했을 때의 실수 — MyBatis식 이름 + 타입 이름으로 호출
+
+```java
+public interface AuthRepository extends JpaRepository<User, String> {
+    int selectCountById(String userId);     // ← select는 접두사가 아님
+}
+
+// AuthService
+int count = AuthRepository.selectCountById(registerRequest.userId());   // ← 필드 없이 타입 이름으로 호출
+```
+
+```
+error: non-static method selectCountById(String) cannot be referenced from a static context
+```
+
+- **원인 1 (컴파일 에러)**: 주입받은 필드(`userRepository`)가 아니라 **인터페이스 이름**으로 호출해서 static 메서드처럼 취급됨. → `private final UserRepository userRepository;` 필드를 선언하고 `userRepository.existsById(...)`로 호출한다 (`@RequiredArgsConstructor`가 생성자 주입)
+- **원인 2 (실행 시 에러)**: `select`는 인식하는 접두사가 아니라, 이름 전체(`selectCountById`)를 필드명으로 해석하려다 `No property ... found for type 'User'` 계열 에러로 앱이 뜨지 않는다. → 기본 제공 `existsById` 사용 (개수가 필요하면 `countById` → `long`)
+- **원인 3 (구조)**: `UserRepository`와 같은 `JpaRepository<User, String>`을 하나 더 만듦. 같은 엔티티의 Repository는 하나로 통일한다 → `AuthRepository` 삭제
+
+### 이름이 너무 길어지면
+
+조건이 3개를 넘어 `findByRoleAndEmailContainingAndCreatedAtAfterOrderBy...`처럼 길어지면 읽기 어렵다. 이럴 땐 `@Query("SELECT u FROM User u WHERE ...")`로 JPQL을 직접 쓴다. 쿼리 메서드는 **조건 1~2개짜리 단순 조회**에 쓴다.
+
+---
+
+## 타입 이름 vs 주입받은 객체 (static context 에러)
+
+`UserRepository`(대문자)는 **인터페이스 이름(타입)** 이고, `userRepository`(소문자)는 **Spring이 주입해준 실제 객체**다. 인스턴스 메서드는 반드시 **객체**로 호출한다.
+
+### 코드
+
+```java
+@Service
+@RequiredArgsConstructor                               // ← final 필드를 받는 생성자 자동 생성
+@Transactional(readOnly = true)
+public class AuthService {
+
+    private final UserRepository userRepository;       // ← 1. 필드 선언 (Spring이 구현체를 주입)
+    private final PasswordEncoder passwordEncoder;
+
+    @Transactional
+    public void register(RegisterRequest request) {
+        if (userRepository.existsById(request.userId())) {   // ← 2. 필드(소문자)로 호출
+            throw new BusinessException(ErrorCode.DUPLICATE_USER_ID);
+        }
+        ...
+    }
+}
+```
+
+### 타입으로 호출 vs 객체로 호출
+
+```
+UserRepository.existsById(...)   → "타입.메서드()" = static 메서드 호출로 해석
+userRepository.existsById(...)   → "객체.메서드()" = 인스턴스 메서드 호출
+```
+
+| | `UserRepository` | `userRepository` |
+|---|---|---|
+| 정체 | 인터페이스(타입, 설계도) | Spring이 넣어준 구현체 객체 (빈) |
+| 어디서 생김 | `interface UserRepository ...` 선언 | `private final` 필드 + 생성자 주입 |
+| 호출 가능한 메서드 | `static` 메서드만 | 인스턴스 메서드 (`existsById`, `save` 등) |
+
+- Repository 메서드(`existsById`, `save`, `existsByEmail`)는 모두 **인스턴스 메서드**라 타입 이름으로 부르면 컴파일 에러다
+- 반대로 `User.create(...)`, `User.createGuest()`, `TokenResponse.guest(...)`는 **static** 정적 팩토리라 타입 이름으로 부르는 게 맞다
+
+| 호출 | static? | 올바른 방식 |
+|---|---|---|
+| `existsById`, `save`, `encode` | X (인스턴스) | `userRepository.existsById(...)`, `passwordEncoder.encode(...)` |
+| `User.create`, `User.createGuest` | O (static) | `User.create(...)` |
+
+### 왜 객체가 필요한가?
+
+인터페이스에는 구현이 없다. `existsById`를 실제로 실행하는 건 Spring Data JPA가 앱 실행 시 만들어주는 **구현체 객체**다. 그 객체를 받으려면 필드를 선언해 **생성자 주입**을 받아야 한다 (→ "JwtProperties" 섹션의 "참고: 생성자 주입과의 관계").
+
+```
+private final UserRepository userRepository;
+→ @RequiredArgsConstructor가 AuthService(UserRepository userRepository) 생성자 생성
+→ Spring이 UserRepository 구현체 빈을 찾아 생성자에 넣어줌
+→ userRepository.existsById(...) 호출 가능
+```
+
+### 처음 작성했을 때의 실수 — 같은 실수 두 번
+
+```java
+int count = AuthRepository.selectCountById(registerRequest.userId());       // 1번째
+boolean user = UserRepository.existsByUserId(registerRequest.userId());     // 2번째
+```
+
+```
+error: non-static method existsByUserId(String) cannot be referenced from a static context
+```
+
+- **원인**: 필드를 선언하지 않고 **인터페이스 이름(대문자)** 으로 호출 → static 호출로 해석됨. Repository를 바꿔도(`AuthRepository` → `UserRepository`) 호출 방식이 그대로라 같은 에러가 반복됨
+- **해결**: `private final UserRepository userRepository;` 필드 선언 → `userRepository.existsById(...)`
+- 함께 고칠 것
+  - `existsByUserId` → 기본 제공 `existsById` (userId가 PK라 같은 기능이 이미 있음. `existsByUserId`도 필드명이 맞아 동작은 한다 → "Spring Data JPA 쿼리 메서드" 섹션)
+  - 변수명 `boolean user` → `exists` 등 담긴 값에 맞게 (User 객체처럼 읽힘). 또는 변수 없이 `if (userRepository.existsById(...))`
+
+> **에러 메시지에 `static context`가 보이면 → "타입 이름으로 인스턴스 메서드를 불렀다"를 먼저 의심한다.**
